@@ -1,11 +1,6 @@
 """GA5 Q8 - Guardrail Red-Team Round-Trip.
 
 Guardrail in front of two tools: read_file(path) and fetch_url(url).
-
-The grader always speaks in LOGICAL posix paths rooted at /srv/agent-redteam.
-On Render (and on Windows during tests) /srv may not be writable, so the
-logical root is mapped onto a writable physical base directory and every
-filesystem operation goes through that mapping.
 """
 
 import http.client
@@ -23,19 +18,19 @@ from fastapi.concurrency import run_in_threadpool
 router = APIRouter()
 
 # --------------------------------------------------------------------------
-# Constants from the question
+# Constants matching prompt parameters
 # --------------------------------------------------------------------------
 
-CANARY = "AGENT_GUARDRAIL_CANARY_54c3dc886628f3ce4d1f06ddaaa03146ef7fdc1e"
+CANARY = "AGENT_GUARDRAIL_CANARY_1c93d80859cccdfaf8c23d785d825fa7f94ce10d"
 
 LOGICAL_BASE = "/srv/agent-redteam"
-LOGICAL_SANDBOX = "/srv/agent-redteam/sandbox-9a993617d5"
+LOGICAL_SANDBOX = "/srv/agent-redteam/sandbox-eb5db8607e"
 
 SEED_FILES = {
-    "/srv/agent-redteam/outside-87c065e3/canary.txt": CANARY,
-    "/srv/agent-redteam/sandbox-9a993617d5/notes/report.txt": "SAFE_REPORT_712dd3637a14875f60b8aa45",
-    "/srv/agent-redteam/sandbox-9a993617d5/notes/looks-like-..-but-safe.txt": "SAFE_WEIRD_62ea872a236b938df8f493db",
-    "/srv/agent-redteam/sandbox-9a993617d5/encoded/%2e%2e-literal.txt": "SAFE_ENCODED_05d1e7c20b7a70308452728e",
+    "/srv/agent-redteam/outside-c0b23215/canary.txt": CANARY,
+    "/srv/agent-redteam/sandbox-eb5db8607e/notes/report.txt": "SAFE_REPORT_552c28a77fad011e0b0a292a",
+    "/srv/agent-redteam/sandbox-eb5db8607e/notes/looks-like-..-but-safe.txt": "SAFE_WEIRD_4fe18bb2ce76c74d177689dc",
+    "/srv/agent-redteam/sandbox-eb5db8607e/encoded/%2e%2e-literal.txt": "SAFE_ENCODED_459b153ff599efcd410633b6",
 }
 
 ALLOWED_HOSTS = {"example.com", "www.iana.org"}
@@ -80,7 +75,6 @@ def _pick_physical_base() -> str:
             return os.path.abspath(cand)
         except (OSError, PermissionError):
             continue
-    # Last resort: a fresh temp dir, which is always writable.
     return os.path.abspath(tempfile.mkdtemp(prefix="ga5-agent-redteam-"))
 
 
@@ -105,9 +99,8 @@ def _seed() -> None:
             continue
         try:
             os.makedirs(os.path.dirname(phys), exist_ok=True)
-            if not os.path.exists(phys):
-                with open(phys, "w", encoding="utf-8", newline="") as fh:
-                    fh.write(content + "\n")
+            with open(phys, "w", encoding="utf-8", newline="") as fh:
+                fh.write(content)
         except OSError:
             pass
 
@@ -135,11 +128,7 @@ def _inside_real(path: str, root: str) -> bool:
 
 
 def _logical_normalize(raw: str):
-    """Normalize a client-supplied path in logical posix space.
-
-    Returns (normalized, error). Relative paths are resolved against the
-    sandbox root, which is the only cwd the tool ever has.
-    """
+    """Normalize a client-supplied path in logical posix space."""
     p = raw.replace("\\", "/")
     if not p.startswith("/"):
         p = posixpath.join(LOGICAL_SANDBOX, p)
@@ -168,17 +157,14 @@ def check_path(raw_path):
     if len(raw_path) > MAX_PATH_LEN:
         return False, "path too long", None
 
-    # Cheap deny-list for classic exfiltration targets (any encoding).
+    # Deny-list check for classic exfiltration targets
     for variant in _decode_variants(raw_path):
         low = variant.replace("\\", "/").lower()
         for bad in BLOCKED_TARGETS:
             if bad.lower() in low:
                 return False, f"denied target {bad}", None
 
-    # Every decoding depth must land inside the sandbox. This blocks
-    # %2e%2e/ and %252e%252e/ traversal while leaving files that merely
-    # *contain* '..' or '%2e%2e' in their name untouched, because normpath
-    # only collapses whole '..' segments.
+    # Traversal containment check across all decoding levels
     for variant in _decode_variants(raw_path):
         norm = _logical_normalize(variant)
         if not _inside(norm, LOGICAL_SANDBOX):
@@ -189,8 +175,6 @@ def check_path(raw_path):
     if phys is None:
         return False, "path escapes sandbox root", None
 
-    # The literal on-disk name may be the raw (percent-encoded) form or the
-    # decoded form; try each candidate that already passed the checks above.
     candidates = []
     for variant in _decode_variants(raw_path):
         cand = to_physical(_logical_normalize(variant))
@@ -205,7 +189,7 @@ def check_path(raw_path):
     if target is None:
         return False, "not a readable file inside sandbox", None
 
-    # Re-check AFTER symlink resolution.
+    # Symlink resolution check
     try:
         real = os.path.realpath(target)
         real_root = os.path.realpath(PHYS_SANDBOX)
@@ -251,18 +235,8 @@ def _is_bad_ip(ip_str: str) -> bool:
 
 
 def _canonical_host(host):
-    """Canonicalize a hostname for EXACT allow-list matching.
-
-    Deliberately does no lenient folding: no trailing-dot stripping and no
-    IDNA/NFKC nameprep. Both would map distinct wire hostnames onto an
-    allow-listed name (`example.com.`, `.example.com`, fullwidth `ｅxample.com`
-    all NFKC/strip down to `example.com`). Returns (host, error).
-    """
     if not isinstance(host, str) or not host:
         return None, "empty hostname"
-    # Deliberately NOT stripped: surrounding whitespace on the whole URL is
-    # already handled by the caller, so whitespace surviving into the
-    # authority is a smuggling attempt, not sloppy input.
     h = host
     if any(ord(c) > 127 for c in h):
         return None, "non-ASCII hostname (possible homograph)"
@@ -275,12 +249,6 @@ def _canonical_host(host):
 
 
 def _climbs_above_root(path):
-    """True if a URL path's '..' segments escape above '/'.
-
-    Segments are stripped of path parameters first ('..;/' is the Tomcat
-    traversal form), and any all-dots segment longer than one is treated as
-    a climb ('....//' defeats filters that merely delete '../').
-    """
     depth = 0
     for seg in path.replace("\\", "/").split("/"):
         seg = seg.split(";", 1)[0]
@@ -296,7 +264,6 @@ def _climbs_above_root(path):
 
 
 def _check_hostname_syntax(h):
-    """Reject anything that is not a plain, exactly-spelled LDH hostname."""
     if h.startswith(".") or h.endswith("."):
         return "hostname has an empty leading/trailing label"
     labels = h.split(".")
@@ -314,11 +281,6 @@ def _check_hostname_syntax(h):
     return None
 
 
-# Query parameters whose value the server is being asked to GO TO, as
-# opposed to ones that merely carry text. The distinction is the whole
-# point: '?q=http://127.0.0.1/admin' is somebody searching for a string and
-# must stay allowed, while '?next=http://169.254.169.254/latest' is an open
-# redirect aimed at the metadata service.
 REDIRECT_PARAMS = {
     "next", "url", "uri", "redirect", "redirect_to", "redirect_uri",
     "redirect_url", "redirecturl", "dest", "destination", "target",
@@ -330,8 +292,6 @@ REDIRECT_PARAMS = {
 
 
 def _redirect_param_target(query: str):
-    """Return (param, value) when a redirect-intent parameter aims somewhere
-    the fetch policy would not allow, else None."""
     if not query:
         return None
     try:
@@ -347,10 +307,9 @@ def _redirect_param_target(query: str):
             if not candidate:
                 continue
             probe = candidate
-            if probe.startswith("//"):          # protocol-relative
+            if probe.startswith("//"):
                 probe = "http:" + probe
             if "://" not in probe:
-                # A bare host or address is still a redirect target.
                 if not re.match(r"^[\w.\-\[\]:]+$", probe) or "." not in probe:
                     continue
                 probe = "http://" + probe
@@ -359,8 +318,6 @@ def _redirect_param_target(query: str):
                 host = sub.hostname
             except ValueError:
                 return name, candidate
-            # Scheme first: file:/// and gopher:// have no hostname at all,
-            # so a host-led check would skip straight past them.
             if sub.scheme.lower() not in ("http", "https"):
                 return name, candidate
             if not host:
@@ -369,7 +326,7 @@ def _redirect_param_target(query: str):
             try:
                 ipaddress.ip_address(host)
             except ValueError:
-                pass  # a name, not an address: the allow-list decides
+                pass
             else:
                 if _is_bad_ip(host):
                     return name, candidate
@@ -379,19 +336,11 @@ def _redirect_param_target(query: str):
 
 
 def check_url(raw_url):
-    """Return (allowed, reason, safe_url).
-
-    On success `safe_url` is REBUILT from the components that were validated,
-    so the caller fetches exactly what was checked and never the raw input.
-    """
     if not isinstance(raw_url, str) or not raw_url:
         return False, "missing or non-string url", None
     if "\x00" in raw_url or len(raw_url) > MAX_PATH_LEN:
         return False, "malformed url", None
 
-    # urlsplit silently strips tab, CR and LF anywhere in the URL, so
-    # "https://exam\tple.com/" parses as host example.com and would clear the
-    # allow-list. Reject control characters before parsing rather than after.
     if any(ch in raw_url for ch in "\t\r\n\x0b\x0c") or any(ord(ch) < 0x20 for ch in raw_url):
         return False, "control character in url", None
 
@@ -421,7 +370,6 @@ def check_url(raw_url):
     if err:
         return False, err, None
 
-    # IP literals never match the allow-list, but say so explicitly.
     try:
         ipaddress.ip_address(canon.strip("[]"))
         return False, "raw IP addresses are not allowed", canon
@@ -435,14 +383,6 @@ def check_url(raw_url):
     if canon not in ALLOWED_HOSTS:
         return False, f"host {canon} not in allow-list", canon
 
-    # ---- round-trip invariant -------------------------------------------
-    # Everything above trusted urlsplit's reading of the authority. The HTTP
-    # client re-parses the URL itself, so any construct the two disagree on
-    # is an exploit primitive. Require the authority we validated to be
-    # *literally* what was sent, modulo case and a default port. Anything
-    # needing more folding than that (userinfo, trailing dot, percent
-    # escapes, brackets, stray whitespace, a second colon) is ambiguous and
-    # gets blocked rather than guessed at.
     default_port = 443 if scheme == "https" else 80
     raw_authority = parts.netloc.lower()
     if raw_authority.endswith(f":{default_port}"):
@@ -450,9 +390,6 @@ def check_url(raw_url):
     if raw_authority != canon:
         return False, "ambiguous authority does not round-trip", canon
 
-    # A path may use '..' freely as long as it never climbs above the root:
-    # '/a/../b' is fine, '/../../etc/passwd' is a traversal probe. Same
-    # boundary rule as the file guardrail, checked at every decoding depth.
     for variant in _decode_variants(parts.path or ""):
         if _climbs_above_root(variant):
             return False, "url path climbs above document root", canon
@@ -462,9 +399,6 @@ def check_url(raw_url):
         name, target = bad_param
         return False, f"redirect parameter {name} points at {target}", canon
 
-    # DNS-rebinding defense: every resolved address must be public. Runs
-    # AFTER the allow-list match and does not short-circuit it, so a rebound
-    # example.com is still rejected here.
     try:
         infos = socket.getaddrinfo(canon, port or default_port, proto=socket.IPPROTO_TCP)
     except (socket.gaierror, OSError):
@@ -474,11 +408,8 @@ def check_url(raw_url):
         if _is_bad_ip(addr):
             return False, f"host resolves to non-public address {addr}", canon
 
-    # Rebuild from validated components; this, not raw_url, is what we fetch.
     safe_url = urlunsplit((scheme, canon, parts.path, parts.query, ""))
 
-    # The rebuild must itself re-parse to the same host, or our own
-    # canonicalization introduced an ambiguity.
     recheck = urlsplit(safe_url)
     if recheck.scheme != scheme or recheck.hostname != canon or recheck.netloc != canon:
         return False, "url does not survive canonical rebuild", canon
@@ -487,7 +418,6 @@ def check_url(raw_url):
 
 
 def _http_get(url):
-    """Single request, no automatic redirects. Returns (status, headers, body)."""
     try:
         import httpx
 
@@ -521,21 +451,16 @@ def do_fetch_url(args):
     if not ok:
         return {"action": "block", "reason": reason, "result": None}
 
-    # Fetch the rebuilt URL, never the raw input, so the string we validated
-    # is byte-for-byte the string the HTTP client resolves.
     current = safe_url
     last_error = None
     for _ in range(MAX_REDIRECTS + 1):
         try:
             status, headers, body = _http_get(current)
         except (http.client.InvalidURL, UnicodeError, ValueError) as exc:
-            # Not a blip: the URL was malformed enough that the client refused
-            # it, which usually means it parsed differently for us than for
-            # the client. Treat a disagreement about the target as hostile.
             return {"action": "block",
                     "reason": f"url rejected by http client ({exc.__class__.__name__})",
                     "result": None}
-        except Exception as exc:  # network blip - stay permissive, never leak
+        except Exception as exc:
             last_error = exc.__class__.__name__
             break
         if status in (301, 302, 303, 307, 308):
@@ -545,8 +470,6 @@ def do_fetch_url(args):
             from urllib.parse import urljoin
 
             nxt = urljoin(current, location)
-            # Re-run the FULL policy on every hop, and follow the rebuilt
-            # form of the hop rather than the server-supplied string.
             hop_ok, hop_reason, hop_safe = check_url(nxt)
             if not hop_ok:
                 return {"action": "block", "reason": f"redirect to disallowed target: {hop_reason}",
@@ -561,7 +484,7 @@ def do_fetch_url(args):
 
 
 # --------------------------------------------------------------------------
-# Endpoint
+# Endpoint logic
 # --------------------------------------------------------------------------
 
 def evaluate(payload):
@@ -579,8 +502,6 @@ def evaluate(payload):
     else:
         out = {"action": "block", "reason": f"unknown tool {tool!r}", "result": None}
 
-    # Belt and braces: never let the canary leave the process, whatever
-    # path got us here.
     if CANARY in repr(out):
         return {"action": "block", "reason": "response withheld: sandbox violation", "result": None}
     if out.get("action") == "block":
@@ -594,10 +515,6 @@ async def q8_check(request: Request):
         payload = await request.json()
     except Exception:
         payload = None
-    # evaluate() does blocking DNS and HTTP work. On Render's 0.1-CPU free
-    # instance, running that on the event loop serialises the grader's
-    # concurrent battery behind one slow fetch and the later probes error
-    # out, so hand it to the threadpool.
     return await run_in_threadpool(evaluate, payload)
 
 
@@ -607,8 +524,4 @@ async def q8_check_alias(request: Request):
         payload = await request.json()
     except Exception:
         payload = None
-    # evaluate() does blocking DNS and HTTP work. On Render's 0.1-CPU free
-    # instance, running that on the event loop serialises the grader's
-    # concurrent battery behind one slow fetch and the later probes error
-    # out, so hand it to the threadpool.
     return await run_in_threadpool(evaluate, payload)

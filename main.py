@@ -1,5 +1,4 @@
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
 from hashlib import sha256
 from fastapi import FastAPI
 from mcp.server.fastmcp import FastMCP
@@ -8,11 +7,11 @@ from mcp.server.transport_security import TransportSecuritySettings
 # Normalized exam email
 EMAIL = "24f2008529@ds.study.iitm.ac.in".strip().lower()
 
-# ContextVar to capture HTTP headers per async request execution
-current_request_headers: ContextVar[dict] = ContextVar("current_request_headers", default={})
+# Global store to bridge header data across FastMCP background task boundaries
+LATEST_HEADERS: dict[str, str] = {}
 
 
-# Pure ASGI Middleware to inspect headers across streaming/HTTP connections
+# Pure ASGI Middleware to inspect and store incoming headers
 class HeaderASGIMiddleware:
     def __init__(self, app):
         self.app = app
@@ -23,17 +22,14 @@ class HeaderASGIMiddleware:
                 k.decode("latin1").lower(): v.decode("latin1")
                 for k, v in scope.get("headers", [])
             }
-            token = current_request_headers.set(headers)
-            try:
-                await self.app(scope, receive, send)
-            finally:
-                current_request_headers.reset(token)
-        else:
-            await self.app(scope, receive, send)
+            # Capture x-exam-challenge whenever present in incoming requests
+            if "x-exam-challenge" in headers:
+                LATEST_HEADERS["x-exam-challenge"] = headers["x-exam-challenge"]
+
+        await self.app(scope, receive, send)
 
 
 # Initialize FastMCP with DNS rebinding protection DISABLED
-# (Prevents 421 Misdirected Request errors on Render / remote hosts)
 mcp = FastMCP(
     "exam",
     transport_security=TransportSecuritySettings(
@@ -43,15 +39,16 @@ mcp = FastMCP(
 
 
 @mcp.tool()
-async def solve_challenge() -> str:
-    """Solves the challenge header using SHA-256 and the normalized email."""
-    headers = current_request_headers.get()
+async def solve_challenge(challenge: str = "") -> str:
+    """Solves the challenge using SHA-256 and the normalized email.
 
-    # Read fresh challenge from X-Exam-Challenge header
-    challenge = headers.get("x-exam-challenge", "")
+    Supports obtaining the challenge either via tool arguments or the X-Exam-Challenge header.
+    """
+    # 1. Fall back to header store if challenge argument is empty
+    ch = challenge.strip() or LATEST_HEADERS.get("x-exam-challenge", "").strip()
 
-    # Compute SHA-256("${challenge}:${normalizedEmail}")
-    payload = f"{challenge}:{EMAIL}".encode("utf-8")
+    # 2. Compute SHA-256("${challenge}:${normalizedEmail}")
+    payload = f"{ch}:{EMAIL}".encode("utf-8")
     return sha256(payload).hexdigest()[:16]
 
 
@@ -85,5 +82,7 @@ app.include_router(q4_router, prefix="/q4")
 app.include_router(q5_router, prefix="/q5")
 app.include_router(q8_router, prefix="/q8")
 
-# Mount MCP app at root
+# Mount MCP app at /mcp to match your submission URL
+app.mount("/mcp", mcp_app)
+# Also mount at root for backward compatibility
 app.mount("/", mcp_app)

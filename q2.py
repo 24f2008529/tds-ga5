@@ -1,21 +1,28 @@
-import calendar
-from fastapi import APIRouter, Request
+from fastapi import APIRouter
+from pydantic import BaseModel
 
 router = APIRouter()
 
-@router.post("/prorate")
-async def prorate(req: Request):
-    b = await req.json()
 
-    old = b["old_price"]
-    new = b["new_price"]
-    year = b["year"]
-    month = b["month"]
-    day = b["upgrade_day"]
+class ProrationRequest(BaseModel):
+    old_price: float
+    new_price: float
+    days_remaining: int
+    days_in_actual_month: int
+    spec: str
 
-    dim = calendar.monthrange(year, month)[1]
-    remaining = dim - day + 1
 
-    charge = round((new - old) * (remaining / dim), 2)
+@router.post("/")
+def prorate(data: ProrationRequest):
+    diff = data.new_price - data.old_price
+
+    if data.spec == "v1":
+        divisor = 30
+    elif data.spec == "v2":
+        divisor = data.days_in_actual_month
+    else:
+        return {"error": "Invalid spec"}
+
+    charge = round(diff * data.days_remaining / divisor, 2)
 
     return {"charge": charge}

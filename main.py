@@ -3,15 +3,16 @@ from contextvars import ContextVar
 from hashlib import sha256
 from fastapi import FastAPI
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 # Normalized exam email
 EMAIL = "24f2008529@ds.study.iitm.ac.in".strip().lower()
 
-# ContextVar to store request headers across async context
+# ContextVar to capture HTTP headers per async request execution
 current_request_headers: ContextVar[dict] = ContextVar("current_request_headers", default={})
 
 
-# Pure ASGI Middleware to capture headers
+# Pure ASGI Middleware to inspect headers across streaming/HTTP connections
 class HeaderASGIMiddleware:
     def __init__(self, app):
         self.app = app
@@ -31,8 +32,14 @@ class HeaderASGIMiddleware:
             await self.app(scope, receive, send)
 
 
-# Expose EXACTLY ONE tool named solve_challenge
-mcp = FastMCP("exam")
+# Initialize FastMCP with DNS rebinding protection DISABLED
+# (Prevents 421 Misdirected Request errors on Render / remote hosts)
+mcp = FastMCP(
+    "exam",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False
+    ),
+)
 
 
 @mcp.tool()
@@ -48,24 +55,24 @@ async def solve_challenge() -> str:
     return sha256(payload).hexdigest()[:16]
 
 
-# 1. Create the FastMCP sub-app
+# Build streamable HTTP application
 mcp_app = mcp.streamable_http_app()
 
 
-# 2. CRITICAL FIX: Explicitly run the MCP sub-app lifespan within FastAPI
+# Explicitly invoke FastMCP's internal task group via FastAPI's lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with mcp_app.router.lifespan_context(mcp_app):
         yield
 
 
-# 3. Create FastAPI app with the combined lifespan
+# Initialize main FastAPI instance
 app = FastAPI(lifespan=lifespan)
 
-# Add header middleware
+# Add middleware for header interception
 app.add_middleware(HeaderASGIMiddleware)
 
-# Include routers from other exam questions
+# Include question routers
 from q2 import router as q2_router
 from q3 import router as q3_router
 from q4 import router as q4_router
@@ -78,5 +85,5 @@ app.include_router(q4_router, prefix="/q4")
 app.include_router(q5_router, prefix="/q5")
 app.include_router(q8_router, prefix="/q8")
 
-# 4. Mount MCP app at root (it handles /mcp automatically)
+# Mount MCP app at root
 app.mount("/", mcp_app)

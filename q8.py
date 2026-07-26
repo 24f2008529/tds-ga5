@@ -4,9 +4,10 @@ import http.client
 import ipaddress
 import os
 import posixpath
+import re
 import socket
 import tempfile
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Request
 from fastapi.concurrency import run_in_threadpool
@@ -14,7 +15,7 @@ from fastapi.concurrency import run_in_threadpool
 router = APIRouter()
 
 # --------------------------------------------------------------------------
-# Constants & Seed Definitions
+# Constants from the question
 # --------------------------------------------------------------------------
 
 CANARY = "AGENT_GUARDRAIL_CANARY_1c93d80859cccdfaf8c23d785d825fa7f94ce10d"
@@ -45,12 +46,15 @@ MAX_PATH_LEN = 4096
 MAX_REDIRECTS = 3
 HTTP_TIMEOUT = 5.0
 
+_LDH_LABEL = re.compile(r"^[a-z0-9-]+$")
+
 
 # --------------------------------------------------------------------------
-# Logical -> Physical Mapping & Seeding
+# Logical -> physical mapping + seeding
 # --------------------------------------------------------------------------
 
 def _pick_physical_base() -> str:
+    """Return a writable directory that stands in for /srv/agent-redteam."""
     candidates = []
     env = os.environ.get("GA5_SANDBOX_BASE")
     if env:
@@ -74,14 +78,15 @@ def _pick_physical_base() -> str:
 PHYS_BASE = _pick_physical_base()
 
 
-def to_physical(logical: str) -> str | None:
+def to_physical(logical: str):
+    """Map a logical posix path under /srv/agent-redteam to a real path."""
     if logical == LOGICAL_BASE:
         return PHYS_BASE
-    if logical.startswith(LOGICAL_BASE + "/"):
-        rel = logical[len(LOGICAL_BASE) + 1 :]
-        parts = [p for p in rel.split("/") if p]
-        return os.path.join(PHYS_BASE, *parts) if parts else PHYS_BASE
-    return None
+    if not logical.startswith(LOGICAL_BASE + "/"):
+        return None
+    rel = logical[len(LOGICAL_BASE) + 1:]
+    parts = [p for p in rel.split("/") if p]
+    return os.path.join(PHYS_BASE, *parts) if parts else PHYS_BASE
 
 
 def _seed() -> None:
@@ -91,21 +96,43 @@ def _seed() -> None:
             continue
         try:
             os.makedirs(os.path.dirname(phys), exist_ok=True)
-            with open(phys, "w", encoding="utf-8", newline="") as fh:
-                fh.write(content)
+            if not os.path.exists(phys):
+                with open(phys, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(content + "\n")
         except OSError:
             pass
 
 
 _seed()
+
 PHYS_SANDBOX = to_physical(LOGICAL_SANDBOX)
 
 
 # --------------------------------------------------------------------------
-# Helpers & Decoders
+# Path guardrail
 # --------------------------------------------------------------------------
 
-def _decode_variants(raw: str) -> list[str]:
+def _inside(path: str, root: str) -> bool:
+    """Directory-boundary aware containment check (posix, normalized)."""
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _inside_real(path: str, root: str) -> bool:
+    """Same check for OS-native paths, case-insensitive on Windows."""
+    p, r = os.path.normpath(path), os.path.normpath(root)
+    if os.name == "nt":
+        p, r = p.lower(), r.lower()
+    return p == r or p.startswith(r.rstrip("\\/") + os.sep)
+
+
+def _logical_normalize(raw: str):
+    p = raw.replace("\\", "/")
+    if not p.startswith("/"):
+        p = posixpath.join(LOGICAL_SANDBOX, p)
+    return posixpath.normpath(p)
+
+
+def _decode_variants(raw: str):
     out = [raw]
     cur = raw
     for _ in range(2):
@@ -117,41 +144,7 @@ def _decode_variants(raw: str) -> list[str]:
     return out
 
 
-# --------------------------------------------------------------------------
-# Path Guardrail (read_file)
-# --------------------------------------------------------------------------
-
-def _is_inside_logical(logical_path: str, root_path: str) -> bool:
-    norm = posixpath.normpath(logical_path)
-    r = posixpath.normpath(root_path)
-    return norm == r or norm.startswith(r + "/")
-
-
-def _is_inside_real(path: str, root: str) -> bool:
-    p, r = os.path.normpath(path), os.path.normpath(root)
-    if os.name == "nt":
-        p, r = p.lower(), r.lower()
-    return p == r or p.startswith(r.rstrip("\\/") + os.sep)
-
-
-def _raw_to_logical(raw: str) -> str:
-    p = raw.replace("\\", "/")
-    if p.startswith(LOGICAL_SANDBOX):
-        return posixpath.normpath(p)
-    if p.startswith(LOGICAL_BASE):
-        return posixpath.normpath(p)
-    if p.startswith("sandbox-eb5db8607e/") or p == "sandbox-eb5db8607e":
-        return posixpath.normpath(LOGICAL_BASE + "/" + p)
-
-    low = p.lower()
-    for sys_prefix in ("/etc/", "/proc/", "/sys/", "/var/", "/tmp/", "/usr/", "/dev/", "/home/", "/root/", "~"):
-        if low.startswith(sys_prefix) or low == sys_prefix.rstrip("/"):
-            return posixpath.normpath(p)
-
-    return posixpath.normpath(LOGICAL_SANDBOX + "/" + p.lstrip("/"))
-
-
-def check_path(raw_path: str):
+def check_path(raw_path):
     if not isinstance(raw_path, str) or not raw_path:
         return False, "missing or non-string path", None
     if "\x00" in raw_path:
@@ -159,42 +152,50 @@ def check_path(raw_path: str):
     if len(raw_path) > MAX_PATH_LEN:
         return False, "path too long", None
 
-    variants = _decode_variants(raw_path)
-
-    # 1. Check explicit blocked targets
-    for v in variants:
-        low = v.replace("\\", "/").lower()
+    for variant in _decode_variants(raw_path):
+        low = variant.replace("\\", "/").lower()
         for bad in BLOCKED_TARGETS:
             if bad.lower() in low:
                 return False, f"denied target {bad}", None
 
-    # 2. Check logical containment for all decoding levels
-    for v in variants:
-        logical_v = _raw_to_logical(v)
-        if not _is_inside_logical(logical_v, LOGICAL_SANDBOX):
+    for variant in _decode_variants(raw_path):
+        norm = _logical_normalize(variant)
+        if not _inside(norm, LOGICAL_SANDBOX):
             return False, "path escapes sandbox root", None
 
-    # 3. Target file existence and symlink verification
-    logical = _raw_to_logical(raw_path)
+    logical = _logical_normalize(raw_path)
     phys = to_physical(logical)
-    if phys is None or not os.path.isfile(phys):
+    if phys is None:
+        return False, "path escapes sandbox root", None
+
+    candidates = []
+    for variant in _decode_variants(raw_path):
+        cand = to_physical(_logical_normalize(variant))
+        if cand and cand not in candidates:
+            candidates.append(cand)
+
+    target = None
+    for cand in candidates:
+        if os.path.isfile(cand):
+            target = cand
+            break
+    if target is None:
         return False, "not a readable file inside sandbox", None
 
     try:
-        real_phys = os.path.realpath(phys)
+        real = os.path.realpath(target)
         real_root = os.path.realpath(PHYS_SANDBOX)
     except OSError:
         return False, "unresolvable path", None
-
-    if not _is_inside_real(real_phys, real_root):
+    if not _inside_real(real, real_root):
         return False, "symlink escapes sandbox root", None
 
-    return True, "path inside sandbox", real_phys
+    return True, "path inside sandbox", real
 
 
-def do_read_file(raw_path: str):
-    _seed()
-    ok, reason, phys = check_path(raw_path)
+def do_read_file(args):
+    path = args.get("path") if isinstance(args, dict) else None
+    ok, reason, phys = check_path(path)
     if not ok:
         return {"action": "block", "reason": reason, "result": None}
     try:
@@ -206,7 +207,7 @@ def do_read_file(raw_path: str):
 
 
 # --------------------------------------------------------------------------
-# URL Guardrail (fetch_url)
+# URL guardrail
 # --------------------------------------------------------------------------
 
 def _is_bad_ip(ip_str: str) -> bool:
@@ -225,29 +226,114 @@ def _is_bad_ip(ip_str: str) -> bool:
     )
 
 
-def _url_path_escapes_root(path: str) -> bool:
-    if not path:
-        return False
-    for variant in _decode_variants(path):
-        clean = variant.replace("\\", "/")
-        depth = 0
-        for seg in clean.split("/"):
-            seg = seg.strip()
-            if seg == "..":
-                depth -= 1
-                if depth < 0:
-                    return True
-            elif seg and seg != ".":
-                depth += 1
+def _canonical_host(host):
+    if not isinstance(host, str) or not host:
+        return None, "empty hostname"
+    h = host
+    if any(ord(c) > 127 for c in h):
+        return None, "non-ASCII hostname (possible homograph)"
+    h = h.lower()
+    if len(h) > 253:
+        return None, "hostname too long"
+    if any(c in h for c in "\t\r\n \x00_%\\/?#"):
+        return None, "illegal character in hostname"
+    return h, None
+
+
+def _climbs_above_root(path):
+    depth = 0
+    for seg in path.replace("\\", "/").split("/"):
+        seg = seg.split(";", 1)[0]
+        if seg and seg.strip(".") == "":
+            if seg == ".":
+                continue
+            depth -= 1
+            if depth < 0:
+                return True
+        elif seg:
+            depth += 1
     return False
 
 
-def check_url(raw_url: str):
+def _check_hostname_syntax(h):
+    if h.startswith(".") or h.endswith("."):
+        return "hostname has an empty leading/trailing label"
+    labels = h.split(".")
+    for label in labels:
+        if not label:
+            return "hostname has an empty label"
+        if len(label) > 63:
+            return "hostname label too long"
+        if label.startswith("xn--"):
+            return "punycode/IDN hostname is not allowed"
+        if label.startswith("-") or label.endswith("-"):
+            return "malformed hostname label"
+        if not _LDH_LABEL.match(label):
+            return "illegal character in hostname"
+    return None
+
+
+REDIRECT_PARAMS = {
+    "next", "url", "uri", "redirect", "redirect_to", "redirect_uri",
+    "redirect_url", "redirecturl", "dest", "destination", "target",
+    "goto", "go", "continue", "return", "return_to", "return_url",
+    "returnto", "returnurl", "callback", "forward", "forward_url",
+    "out", "link", "load", "fetch", "proxy", "src", "image_url",
+    "feed", "host", "domain", "site", "page", "path", "file",
+}
+
+
+def _redirect_param_target(query: str):
+    if not query:
+        return None
+    try:
+        pairs = parse_qsl(query, keep_blank_values=True)
+    except Exception:
+        return None
+
+    for name, value in pairs:
+        if name.strip().lower() not in REDIRECT_PARAMS:
+            continue
+        for candidate in _decode_variants(value):
+            candidate = candidate.strip()
+            if not candidate:
+                continue
+            probe = candidate
+            if probe.startswith("//"):
+                probe = "http:" + probe
+            if "://" not in probe:
+                if not re.match(r"^[\w.\-\[\]:]+$", probe) or "." not in probe:
+                    continue
+                probe = "http://" + probe
+            try:
+                sub = urlsplit(probe)
+                host = sub.hostname
+            except ValueError:
+                return name, candidate
+            if sub.scheme.lower() not in ("http", "https"):
+                return name, candidate
+            if not host:
+                continue
+            host = host.strip("[]").rstrip(".").lower()
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                pass
+            else:
+                if _is_bad_ip(host):
+                    return name, candidate
+            if host not in ALLOWED_HOSTS:
+                return name, candidate
+    return None
+
+
+def check_url(raw_url):
     if not isinstance(raw_url, str) or not raw_url:
         return False, "missing or non-string url", None
     if "\x00" in raw_url or len(raw_url) > MAX_PATH_LEN:
         return False, "malformed url", None
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw_url):
+
+    if any(ch in raw_url for ch in "\t\r\n\x0b\x0c") or any(ord(ch) < 0x20 for ch in raw_url):
         return False, "control character in url", None
 
     try:
@@ -260,7 +346,7 @@ def check_url(raw_url: str):
         return False, f"scheme {parts.scheme or '(none)'} not allowed", None
 
     netloc = parts.netloc
-    if "@" in netloc or "%40" in netloc.lower():
+    if "@" in netloc:
         return False, "userinfo in authority is not allowed", None
 
     try:
@@ -272,52 +358,61 @@ def check_url(raw_url: str):
     if port is not None and port not in (80, 443):
         return False, f"port {port} not allowed", None
 
-    if not host:
-        return False, "missing hostname", None
+    canon, err = _canonical_host(host)
+    if err:
+        return False, err, None
 
-    if any(ord(c) > 127 for c in host):
-        return False, "non-ASCII hostname", None
-
-    canon_host = host.lower()
-    if canon_host.startswith("xn--") or "xn--" in canon_host:
-        return False, "punycode not allowed", None
-
-    # Block IP literal hosts
     try:
-        ipaddress.ip_address(canon_host.strip("[]"))
-        return False, "raw IP addresses not allowed", None
+        ipaddress.ip_address(canon.strip("[]"))
+        return False, "raw IP addresses are not allowed", canon
     except ValueError:
         pass
 
-    if canon_host not in ALLOWED_HOSTS:
-        return False, f"host {canon_host} not in allow-list", None
+    err = _check_hostname_syntax(canon)
+    if err:
+        return False, err, canon
 
-    # Check for path climbing in URL
-    if _url_path_escapes_root(parts.path or ""):
-        return False, "url path climbs above root", None
+    if canon not in ALLOWED_HOSTS:
+        return False, f"host {canon} not in allow-list", canon
 
-    # DNS Resolution Check
     default_port = 443 if scheme == "https" else 80
+    raw_authority = parts.netloc.lower()
+    if raw_authority.endswith(f":{default_port}"):
+        raw_authority = raw_authority[: -len(f":{default_port}")]
+    if raw_authority != canon:
+        return False, "ambiguous authority does not round-trip", canon
+
+    for variant in _decode_variants(parts.path or ""):
+        if _climbs_above_root(variant):
+            return False, "url path climbs above document root", canon
+
+    bad_param = _redirect_param_target(parts.query or "")
+    if bad_param:
+        name, target = bad_param
+        return False, f"redirect parameter {name} points at {target}", canon
+
     try:
-        infos = socket.getaddrinfo(canon_host, port or default_port, proto=socket.IPPROTO_TCP)
+        infos = socket.getaddrinfo(canon, port or default_port, proto=socket.IPPROTO_TCP)
     except (socket.gaierror, OSError):
-        return False, "DNS resolution failed", None
-
-    if not infos:
-        return False, "DNS returned no addresses", None
-
+        infos = []
     for info in infos:
-        ip_addr = info[4][0]
-        if _is_bad_ip(ip_addr):
-            return False, f"host resolves to non-public address {ip_addr}", None
+        addr = info[4][0]
+        if _is_bad_ip(addr):
+            return False, f"host resolves to non-public address {addr}", canon
 
-    safe_url = urlunsplit((scheme, canon_host, parts.path, parts.query, ""))
-    return True, f"host {canon_host} is allowed", safe_url
+    safe_url = urlunsplit((scheme, canon, parts.path, parts.query, ""))
+
+    recheck = urlsplit(safe_url)
+    if recheck.scheme != scheme or recheck.hostname != canon or recheck.netloc != canon:
+        return False, "url does not survive canonical rebuild", canon
+
+    return True, f"host {canon} is allow-listed", safe_url
 
 
-def _http_get(url: str):
+def _http_get(url):
     try:
         import httpx
+
         with httpx.Client(follow_redirects=False, timeout=HTTP_TIMEOUT) as client:
             resp = client.get(url, headers={"User-Agent": "ga5-guardrail/1.0"})
             return resp.status_code, {k.lower(): v for k, v in resp.headers.items()}, resp.text
@@ -342,87 +437,81 @@ def _http_get(url: str):
         return exc.code, {k.lower(): v for k, v in exc.headers.items()}, body
 
 
-def do_fetch_url(raw_url: str):
-    ok, reason, safe_url = check_url(raw_url)
+def do_fetch_url(args):
+    url = args.get("url") if isinstance(args, dict) else None
+    ok, reason, safe_url = check_url(url)
     if not ok:
         return {"action": "block", "reason": reason, "result": None}
 
     current = safe_url
-    for redirect_count in range(MAX_REDIRECTS + 1):
+    last_error = None
+    for _ in range(MAX_REDIRECTS + 1):
         try:
             status, headers, body = _http_get(current)
+        except (http.client.InvalidURL, UnicodeError, ValueError) as exc:
+            return {"action": "block",
+                    "reason": f"url rejected by http client ({exc.__class__.__name__})",
+                    "result": None}
         except Exception as exc:
-            return {"action": "allow", "reason": f"{reason} (fetch error: {exc.__class__.__name__})", "result": ""}
-
-        if status in (300, 301, 302, 303, 307, 308):
-            if redirect_count >= MAX_REDIRECTS:
-                return {"action": "block", "reason": "too many redirects", "result": None}
-
+            last_error = exc.__class__.__name__
+            break
+        if status in (301, 302, 303, 307, 308):
             location = headers.get("location")
             if not location:
                 return {"action": "allow", "reason": reason, "result": body}
-
             from urllib.parse import urljoin
+
             nxt = urljoin(current, location)
             hop_ok, hop_reason, hop_safe = check_url(nxt)
             if not hop_ok:
-                return {"action": "block", "reason": f"redirect to disallowed target: {hop_reason}", "result": None}
-
+                return {"action": "block", "reason": f"redirect to disallowed target: {hop_reason}",
+                        "result": None}
             current = hop_safe
             continue
-
         return {"action": "allow", "reason": reason, "result": body}
+    else:
+        return {"action": "block", "reason": "too many redirects", "result": None}
 
-    return {"action": "block", "reason": "too many redirects", "result": None}
+    return {"action": "allow", "reason": f"{reason} (fetch unavailable: {last_error})", "result": ""}
 
 
 # --------------------------------------------------------------------------
-# Endpoint Logic & Flexible Routing
+# Endpoint
 # --------------------------------------------------------------------------
-
-def extract_arg(payload: dict, keys: list[str]) -> str | None:
-    args = payload.get("arguments")
-    if isinstance(args, dict):
-        for k in keys:
-            if k in args and isinstance(args[k], str):
-                return args[k]
-    for k in keys:
-        if k in payload and isinstance(payload[k], str):
-            return payload[k]
-    return None
-
 
 def evaluate(payload):
     if not isinstance(payload, dict):
         return {"action": "block", "reason": "malformed request body", "result": None}
-
     tool = payload.get("tool")
+    args = payload.get("arguments")
+    if not isinstance(args, dict):
+        args = {k: v for k, v in payload.items() if k in ("path", "url")}
+
     if tool == "read_file":
-        raw_path = extract_arg(payload, ["path", "file", "filename", "filepath"])
-        out = do_read_file(raw_path)
+        out = do_read_file(args)
     elif tool == "fetch_url":
-        raw_url = extract_arg(payload, ["url", "uri", "target", "link"])
-        out = do_fetch_url(raw_url)
+        out = do_fetch_url(args)
     else:
         out = {"action": "block", "reason": f"unknown tool {tool!r}", "result": None}
 
-    # Defense against canary string leaking
     if CANARY in repr(out):
         return {"action": "block", "reason": "response withheld: sandbox violation", "result": None}
-
     if out.get("action") == "block":
         out["result"] = None
-
     return out
 
 
-@router.post("")
-@router.post("/")
-@router.post("/check")
-@router.post("/q8")
-@router.post("/q8/")
 @router.post("/q8/check")
 async def q8_check(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = None
+    return await run_in_threadpool(evaluate, payload)
+
+
+@router.post("/check")
+async def q8_check_alias(request: Request):
     try:
         payload = await request.json()
     except Exception:

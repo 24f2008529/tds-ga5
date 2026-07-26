@@ -6,8 +6,8 @@ from q4 import router as q4_router
 from q5 import router as q5_router
 
 from hashlib import sha256
-from mcp.server.fastmcp import FastMCP
-from starlette.requests import Request
+
+from mcp.server.fastmcp import FastMCP, Context
 
 EMAIL = "24f2008529@ds.study.iitm.ac.in".strip().lower()
 
@@ -20,12 +20,12 @@ app.include_router(q4_router, prefix="/q4")
 app.include_router(q5_router, prefix="/q5")
 
 # MCP server
+
 mcp = FastMCP("exam")
 
-
 @mcp.tool()
-async def solve_challenge(request: Request) -> str:
-    challenge = request.headers["X-Exam-Challenge"]
+async def solve_challenge(ctx: Context) -> str:
+    challenge = ctx.request.headers["X-Exam-Challenge"]
     return sha256(f"{challenge}:{EMAIL}".encode()).hexdigest()[:16]
 
 # Mount MCP at /mcp

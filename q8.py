@@ -102,6 +102,22 @@ PHYS_SANDBOX = to_physical(LOGICAL_SANDBOX)
 
 
 # --------------------------------------------------------------------------
+# Helpers & Decoders
+# --------------------------------------------------------------------------
+
+def _decode_variants(raw: str) -> list[str]:
+    out = [raw]
+    cur = raw
+    for _ in range(2):
+        nxt = unquote(cur)
+        if nxt == cur:
+            break
+        out.append(nxt)
+        cur = nxt
+    return out
+
+
+# --------------------------------------------------------------------------
 # Path Guardrail (read_file)
 # --------------------------------------------------------------------------
 
@@ -116,18 +132,6 @@ def _is_inside_real(path: str, root: str) -> bool:
     if os.name == "nt":
         p, r = p.lower(), r.lower()
     return p == r or p.startswith(r.rstrip("\\/") + os.sep)
-
-
-def _decode_variants(raw: str) -> list[str]:
-    out = [raw]
-    cur = raw
-    for _ in range(2):
-        nxt = unquote(cur)
-        if nxt == cur:
-            break
-        out.append(nxt)
-        cur = nxt
-    return out
 
 
 def _raw_to_logical(raw: str) -> str:
@@ -221,12 +225,29 @@ def _is_bad_ip(ip_str: str) -> bool:
     )
 
 
+def _url_path_escapes_root(path: str) -> bool:
+    if not path:
+        return False
+    for variant in _decode_variants(path):
+        clean = variant.replace("\\", "/")
+        depth = 0
+        for seg in clean.split("/"):
+            seg = seg.strip()
+            if seg == "..":
+                depth -= 1
+                if depth < 0:
+                    return True
+            elif seg and seg != ".":
+                depth += 1
+    return False
+
+
 def check_url(raw_url: str):
     if not isinstance(raw_url, str) or not raw_url:
         return False, "missing or non-string url", None
     if "\x00" in raw_url or len(raw_url) > MAX_PATH_LEN:
         return False, "malformed url", None
-    if any(ord(ch) < 0x20 for ch in raw_url):
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw_url):
         return False, "control character in url", None
 
     try:
@@ -239,7 +260,7 @@ def check_url(raw_url: str):
         return False, f"scheme {parts.scheme or '(none)'} not allowed", None
 
     netloc = parts.netloc
-    if "@" in netloc:
+    if "@" in netloc or "%40" in netloc.lower():
         return False, "userinfo in authority is not allowed", None
 
     try:
@@ -270,6 +291,10 @@ def check_url(raw_url: str):
 
     if canon_host not in ALLOWED_HOSTS:
         return False, f"host {canon_host} not in allow-list", None
+
+    # Check for path climbing in URL
+    if _url_path_escapes_root(parts.path or ""):
+        return False, "url path climbs above root", None
 
     # DNS Resolution Check
     default_port = 443 if scheme == "https" else 80
@@ -323,27 +348,32 @@ def do_fetch_url(raw_url: str):
         return {"action": "block", "reason": reason, "result": None}
 
     current = safe_url
-    for _ in range(MAX_REDIRECTS + 1):
+    for redirect_count in range(MAX_REDIRECTS + 1):
         try:
             status, headers, body = _http_get(current)
         except Exception as exc:
-            break
+            return {"action": "allow", "reason": f"{reason} (fetch error: {exc.__class__.__name__})", "result": ""}
 
-        if status in (301, 302, 303, 307, 308):
+        if status in (300, 301, 302, 303, 307, 308):
+            if redirect_count >= MAX_REDIRECTS:
+                return {"action": "block", "reason": "too many redirects", "result": None}
+
             location = headers.get("location")
             if not location:
                 return {"action": "allow", "reason": reason, "result": body}
+
             from urllib.parse import urljoin
             nxt = urljoin(current, location)
             hop_ok, hop_reason, hop_safe = check_url(nxt)
             if not hop_ok:
                 return {"action": "block", "reason": f"redirect to disallowed target: {hop_reason}", "result": None}
+
             current = hop_safe
             continue
 
         return {"action": "allow", "reason": reason, "result": body}
 
-    return {"action": "allow", "reason": f"{reason} (fetch fallback)", "result": ""}
+    return {"action": "block", "reason": "too many redirects", "result": None}
 
 
 # --------------------------------------------------------------------------

@@ -501,8 +501,7 @@ def evaluate(payload):
     return out
 
 
-@router.post("/q8/check")
-async def q8_check(request: Request):
+async def _q8_response(request: Request):
     try:
         payload = await request.json()
     except Exception:
@@ -510,10 +509,16 @@ async def q8_check(request: Request):
     return await run_in_threadpool(evaluate, payload)
 
 
+# main.py mounts this router at /q8.  The submitted public URL is therefore
+# /q8/ (not /q8/check); keeping this explicit prevents FastAPI from returning
+# a 404/405 before the guardrail sees the request.
+@router.post("/")
+async def q8_root(request: Request):
+    return await _q8_response(request)
+
+
+# Useful local/debug alias.  This intentionally becomes /q8/check once the
+# router is included by main.py.
 @router.post("/check")
 async def q8_check_alias(request: Request):
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = None
-    return await run_in_threadpool(evaluate, payload)
+    return await _q8_response(request)
